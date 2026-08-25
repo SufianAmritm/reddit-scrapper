@@ -5,7 +5,7 @@
   "type": "commonjs",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node init && node src/server.js",
     "login": "node scripts/login.js",
     "check-ip": "node scripts/check-ip.js",
     "rotate-ip": "node scripts/rotate-ip.js"
