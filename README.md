@@ -1,185 +1,376 @@
-# reddit-scraper-service
+# Reddit Scraper Microservice
 
-Standalone microservice that stands in for Reddit's official API, which is
-currently gated behind approval.
+[![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?style=flat&logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Express.js](https://img.shields.io/badge/Express-4.21.1-000000?style=flat&logo=express&logoColor=white)](https://expressjs.com/)
+[![Patchright](https://img.shields.io/badge/Patchright-Stealth_Automation-8A2BE2?style=flat)](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright)
+[![License](https://img.shields.io/badge/License-Private-lightgrey?style=flat)]()
 
-**Read this before running it.** This scrapes old.reddit.com's `.json`
-endpoints without Reddit's authorization under their current API terms — Reddit's
-user agreement prohibits unauthorized automated access, and they're actively
-litigating scrapers right now (suing Anthropic over continued scraping, as of
-2026). As of May-Jul 2026 Reddit also **requires a logged-in session** to access
-this content at all — see "Why a login is required" below — which means this now
-runs *as* a Reddit account, not just from an IP. Ban risk is at the account level,
-not just the IP level. This is a deliberate, low-volume, disclosed tradeoff (see
-`mention-finder`'s README), not something to expand or point at other sites
-without the same conversation happening again. Don't turn this into a general-purpose Reddit crawler, and use
-a dedicated throwaway account, not a real/business one.
+A robust, low-volume Node.js microservice designed to fetch Reddit subreddit listings and post details via stealth browser automation and sticky residential proxying. Built as an alternative data ingestion layer for upstream consumers (such as `mention-finder`).
 
-## Why a login is required
+> [!WARNING]
+> **Important Compliance & Risk Notice:**
+> Reddit strictly prohibits unauthorized automated access and actively enforces bot protections (Akamai, Cloudflare, per-IP rate gating). As of mid-2026, Reddit requires authenticated user sessions for `.json` endpoints.
+> - Always use a **dedicated throwaway account**, never personal or business accounts.
+> - Run this service for **low-volume, rate-controlled polling only** (e.g., daily scheduled ingestion).
+> - Account-level and IP-level ban risks are inherent; do not use as a high-concurrency or high-volume crawler.
 
-Confirmed by testing (Aug 2026): anonymous `.json` requests get an immediate,
-consistent `403` regardless of IP class (datacenter or residential) or browser
-stealth quality. That's because Reddit deprecated unauthenticated `.json` access
-outright on **May 28, 2026** ("these endpoints can be used to scrape Reddit
-without accountability" — Reddit's own announcement) and started requiring a
-logged-in session for old.reddit.com generally in **July 2026**. No amount of
-proxy/fingerprint tuning fixes a hard authentication requirement — the fix is a
-real logged-in session, reused.
+---
 
-## Non-negotiable: this must run headed, not headless
+## Table of Contents
 
-`headless: true` **does not work** and is not a tuning knob. Patchright's stealth
-patches do not cover headless mode — Chrome still reports
-`HeadlessChrome/NNN` in its User-Agent (and other headless tells), which Akamai
-rejects instantly on `.json` endpoints. The Patchright maintainers closed this
-as [won't-fix](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python/issues/46).
+- [Architecture & Key Concepts](#architecture--key-concepts)
+  - [Why Authenticated Sessions Are Required](#why-authenticated-sessions-are-required)
+  - [Non-Negotiable: Headed Execution](#non-negotiable-this-must-run-headed-not-headless)
+  - [Sticky Residential IP Management](#sticky-residential-ip-management)
+  - [Rate Limiting, Jitter & Caching](#rate-limiting-jitter--caching)
+- [Prerequisites](#prerequisites)
+- [Installation & Quick Start](#installation--quick-start)
+- [Configuration Reference](#configuration-reference)
+- [CLI Scripts](#cli-scripts)
+- [API Reference](#api-reference)
+  - [Health Check (`GET /healthz`)](#1-health-check)
+  - [Fetch Subreddit Posts (`GET /subreddit/:name/new`)](#2-fetch-new-subreddit-posts)
+  - [Fetch Single Post (`GET /post/:id`)](#3-fetch-post-by-id)
+- [Production Deployment](#production-deployment)
+- [Troubleshooting & Gotchas](#troubleshooting--gotchas)
+- [Project Structure](#project-structure)
 
-Measured on the same proxy IP, same profile:
+---
 
-| mode | reported User-Agent | `.json` fetch |
-| --- | --- | --- |
-| `headless: true` | `HeadlessChrome/151.0.0.0` | 403 blocked |
-| `headless: false` | `Chrome/151.0.0.0` | 200 OK |
-
-So `src/fetcher/browser.js` and `scripts/check-ip.js` launch with
-`headless: false` plus `--window-position=-2400,-2400`, which parks the window
-off-screen — a real rendered browser, just not one you have to look at. Don't
-"optimize" this back to headless; it will silently start 403ing again.
-
-The documented-working Patchright combination, which this service follows
-exactly: `launchPersistentContext` + `channel: "chrome"` + `headless: false` +
-`viewport: null`, and **no** custom user-agent or header overrides (setting your
-own UA re-introduces mismatches with Chrome's client hints).
-
-## Rotating the exit IP
-
-The sticky session token is an arbitrary string this service generates and
-stores in `data/.proxy-session` — not something the IPRoyal (this repo used) dashboard has to
-issue. So a rate-limited or blocked IP is **not** a multi-day outage:
+## Architecture & Key Concepts
 
 ```
-npm run rotate-ip
+┌─────────────────────────┐
+│  Caller (e.g. Service)  │
+└───────────┬─────────────┘
+            │ HTTP + Bearer Token
+            ▼
+┌──────────────────────────────────────────────────────────┐
+│              reddit-scraper-service (Express)             │
+│                                                          │
+│  1. Bearer Token Authentication Check                    │
+│  2. In-Memory Cache Lookup (TTL: 30 min)                 │
+│  3. FIFO Rate Limiter (Politeness Floor + Jitter)        │
+└───────────┬──────────────────────────────────────────────┘
+            │
+            ▼
+┌──────────────────────────────────────────────────────────┐
+│             Stealth Engine (Patchright + Chrome)         │
+│                                                          │
+│  - Persistent On-Disk Profile (`data/browser-profile`)   │
+│  - Headed Mode parked off-screen (-2400, -2400)          │
+│  - Sticky Residential Exit IP (`geo.iproyal.com:12321`)  │
+└───────────┬──────────────────────────────────────────────┘
+            │ Authenticated GET old.reddit.com/r/.../new.json
+            ▼
+┌─────────────────────────┐
+│       Reddit.com        │
+└─────────────────────────┘
 ```
 
-That mints a new token, which gets you a new exit IP on the next launch.
-Restart the service afterwards, and `npm run check-ip` to confirm the new IP is
-clean. `PROXY_STICKY_LIFETIME` (default `24h`) only caps how long one IP is
-held; it does not lock you in.
+### Why Authenticated Sessions Are Required
+Anonymous `.json` requests return an immediate `403 Forbidden` across both datacenter and residential IPs due to Reddit's anti-scraping policy updates. Reddit deprecated unauthenticated `.json` access and mandates an active, logged-in session. To reliably fetch data, this microservice reuses a genuine, human-authenticated Chrome profile.
 
-## "Whoa there, pardner!" (too many requests) is an IP problem, not a code problem
+### Non-Negotiable: This Must Run Headed, Not Headless
+`headless: true` **does not work**. Stealth patches in automation frameworks do not fully mask headless artifacts (such as `HeadlessChrome` in the User-Agent and missing graphics stack parameters), which Akamai and Reddit bot-defense systems detect and block immediately on `.json` endpoints.
 
-This wall is Reddit's raw per-IP request-volume gate, separate from the
-Akamai/fingerprint bot check Patchright already handles. It fires when the
-exit IP itself has made too many recent requests to Reddit — on cheap shared
-residential pools (IPRoyal's lower tiers included) that's very often **other
-customers'** traffic through the same IP, not yours. No amount of stealth
-browser tuning fixes an already-hot IP; the fix is a clean exit IP. Before
-running `npm run login`, run:
+| Mode | User-Agent Reported | Reddit `.json` Fetch | Result |
+| :--- | :--- | :--- | :--- |
+| `headless: true` | `HeadlessChrome/151.x` | 403 Forbidden | **Blocked** |
+| `headless: false` | `Chrome/151.x` | 200 OK | **Success** |
 
-```
-npm run check-ip
+To solve this without disturbing your desktop, the browser runs in headed mode (`headless: false`) positioned off-screen using the Chromium flag:
+```js
+args: ["--window-position=-2400,-2400", "--window-size=1280,800"]
 ```
 
-It loads reddit.com's homepage (not `/login`) through the current sticky
-session and tells you if that IP is already blocked, so you're not burning a
-login attempt (and further souring that IP) to find out. If it reports
-`BLOCKED`, generate a fresh Sticky IP session on the IPRoyal dashboard and
-check again before retrying login.
+### Sticky Residential IP Management
+A logged-in account hopping IP addresses or geographic locations between every request triggers fraud and account takeover flags. Therefore:
+- The service uses **Sticky Residential Proxies** (IPRoyal by default).
+- The sticky session token is stored locally in `data/.proxy-session`.
+- You can instantly rotate to a clean exit IP at any time without accessing the provider dashboard by running `npm run rotate-ip`.
+- `PROXY_STICKY_LIFETIME` (default: `24h`) controls sticky session persistence.
 
-## How it works
+### Rate Limiting, Jitter & Caching
+- **Serialization & Jitter**: All outbound requests pass through a serialized async queue (`src/rateLimiter.js`) with a configurable politeness delay (`MIN_REQUEST_INTERVAL_MS=3000`) and randomized jitter (+0–1500ms).
+- **In-Memory Cache**: Responses are cached for `CACHE_TTL_MINUTES=30`. If Reddit encounters transient upstream issues, the service serves stale cached data as a fallback to avoid downtime.
 
-- `npm run login` (see below) opens a real, visible browser and you manually log
-  into a Reddit account through it — nothing here automates the login or reads
-  credentials from anywhere, you type them into an actual Reddit page yourself,
-  same as any human. Clear any CAPTCHA yourself too. Once logged in, the profile
-  (cookies, storage, everything) is saved to `data/browser-profile/` — a real
-  on-disk Chrome profile directory, not an exported cookie file.
-- The running service (`src/fetcher/browser.js`) launches Patchright against that
-  **same profile directory** via `launchPersistentContext`, reused for every
-  request — not a fresh context per call, and not cookies replayed onto a
-  throwaway context — so it looks like the same continuously-running browser
-  session `npm run login` created, matching how Patchright's stealth patches are
-  meant to be used (real Chrome channel, no forced viewport, no user-agent
-  override).
-- The proxy (`PROXY_MODE=rotating`, IPRoyal by default) is pinned to **one sticky
-  exit IP** via a sticky-session password generated on the provider's dashboard
-  (see Setup below) — a logged-in account jumping between IPs/cities on every
-  request is itself a red flag, so the exit IP has to stay consistent, the
-  opposite of the old anonymous-scraping approach.
-- All requests are still serialized through one queue with a politeness floor +
-  jitter (`src/rateLimiter.js`) — no bursting, same low volume as before (7
-  subreddits, once a day, plus occasional enrichment lookups).
-- If the session expires or gets invalidated, `fetchJson` throws a
-  `SessionInvalidError` and `mention-finder` keeps running without Reddit
-  coverage (logged, not fatal) until you run `npm run login` again.
+---
 
-None of this guarantees the account or IP won't eventually get blocked/banned
-anyway — it minimizes the chance, it doesn't eliminate it.
+## Prerequisites
 
-## Setup
+- **Node.js**: v18.0.0 or higher
+- **Google Chrome**: Installed on the host system (Patchright uses `channel: "chrome"` for optimal stealth).
+- **Residential Proxy**: An active account with [IPRoyal](https://iproyal.com) (or compatible HTTP/HTTPS proxy provider).
+- **Throwaway Reddit Account**: Required for manual one-time login.
 
-```
+---
+
+## Installation & Quick Start
+
+### 1. Clone & Install Dependencies
+```bash
+git clone <repo-url>
+cd reddit-scraper-service
 npm install
+```
+
+*(Optional)* If Google Chrome is not installed on your host machine, install Patchright's Chromium build:
+```bash
+npx patchright install chromium
+```
+
+### 2. Configure Environment
+Copy the sample environment file and configure your credentials:
+```bash
 cp .env.example .env
 ```
 
-Needs a real Google Chrome install on the host (`channel: "chrome"` — Patchright
-launches your actual installed Chrome rather than a bundled/downloaded one,
-which is the more stealth-accurate setup). If Chrome isn't installed, install
-it normally, or fall back to Patchright's bundled Chromium with
-`npx patchright install chromium` and drop `channel: "chrome"` from
-`src/fetcher/browser.js` / `scripts/login.js`.
-
-Fill in `.env`:
-
-- `SERVICE_API_KEY` — shared secret callers (mention-finder) must send as
-  `Authorization: Bearer <key>`. Generate one:
-  `node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"`
-- `ROTATING_PROXY_USERNAME` / `ROTATING_PROXY_PASSWORD` — from
-  [iproyal.com](https://iproyal.com). Use your **base** password only, exactly as
-  shown on the dashboard, with no `_session-…_lifetime-…` suffix appended — the
-  service builds the sticky suffix itself (see "Rotating the exit IP" above).
-  `ROTATING_PROXY_HOST`/`ROTATING_PROXY_PORT` already default to IPRoyal's
-  gateway (`geo.iproyal.com:12321`), no need to change.
-- `PROXY_STICKY_LIFETIME` — how long one exit IP is held, e.g. `30m`, `24h`,
-  `168h`. Default `24h`.
-- `ENABLE_BROWSER_FALLBACK=true` — required now, this is the only path that
-  actually works (see "Why a login is required" above).
-- Everything else has a sane default — see comments in `.env.example`.
-
-Then log in once:
-
+Generate a secure API key for microservice authentication:
+```bash
+node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
 ```
+Paste this key as `SERVICE_API_KEY` in your `.env` file along with your proxy credentials.
+
+### 3. Verify Proxy Exit IP
+Before attempting to log in, verify that your assigned residential IP is not flagged or rate-limited by Reddit:
+```bash
+npm run check-ip
+```
+- If the output shows `RESULT: CLEAN`, proceed to step 4.
+- If the output shows `RESULT: BLOCKED ("whoa there, pardner")`, run `npm run rotate-ip` and test again.
+
+### 4. Perform One-Time Login
+Authenticate your throwaway Reddit account to initialize the persistent profile:
+```bash
 npm run login
 ```
+1. A real browser window will appear.
+2. Manually enter your throwaway account credentials and solve any CAPTCHA.
+3. Once you can view your Reddit home feed, return to the terminal and press **Enter**.
+4. The authenticated session is saved to `data/browser-profile/`.
 
-A browser window opens. Log into your throwaway Reddit account, clear any
-CAPTCHA, then press Enter in the terminal once you can see your feed. This saves
-the Chrome profile to `data/browser-profile/`, which the running service reads
-on startup. Re-run this any time the service logs `SessionInvalidError` (session
-expired/invalidated — Reddit logged the account out).
-
-No Docker, no database. Just:
-
-```
+### 5. Start the Microservice
+```bash
 npm start
 ```
+The server will start on port `4100` (or the configured `PORT`).
 
-Runs a plain Node/Express process on `PORT` (default 4100). To keep it running in
-the background, use a process manager like [pm2](https://pm2.keymetrics.io/)
-(`pm2 start src/server.js --name reddit-scraper-service`) rather than a raw
-terminal — pm2 also restarts it automatically if it crashes (it will **not**
-re-run `npm run login` for you though — that always needs a human).
+---
 
-## API
+## Configuration Reference
 
-All endpoints (except `/healthz`) require `Authorization: Bearer <SERVICE_API_KEY>`.
+All options can be configured via `.env`:
 
-- `GET /healthz` — liveness check, no auth.
-- `GET /subreddit/:name/new?limit=25` — new posts in a subreddit.
-  `{ "posts": [{ source, subreddit, title, url, createdUtc, numComments, score }] }`
-- `GET /post/:id` — a single post by its Reddit ID (the part after `/comments/` in
-  its URL). `{ "post": { created_utc, num_comments, score, subreddit, ... } }`
-  (raw Reddit post shape), or `404` if not found.
-#   r e d d i t - s c r a p p e r  
- 
+| Variable | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `PORT` | `number` | `4100` | Port for the Express HTTP server |
+| `SERVICE_API_KEY` | `string` | *(Required)* | Secret token expected in `Authorization: Bearer <KEY>` |
+| `PROXY_MODE` | `string` | `rotating` | Proxy strategy: `rotating` (IPRoyal residential) or `static` (legacy list) |
+| `ROTATING_PROXY_HOST` | `string` | `geo.iproyal.com` | Residential proxy gateway hostname |
+| `ROTATING_PROXY_PORT` | `number` | `12321` | Residential proxy gateway port |
+| `ROTATING_PROXY_USERNAME` | `string` | `""` | Proxy account username |
+| `ROTATING_PROXY_PASSWORD` | `string` | `""` | Proxy **base password** (plain dashboard password without session suffixes) |
+| `PROXY_STICKY_LIFETIME` | `string` | `24h` | Target lifetime for sticky session (`30m`, `1h`, `24h`, `168h`) |
+| `PROXY_LIST` | `string` | `""` | Delimited list of `host:port:user:pass` (used only when `PROXY_MODE=static`) |
+| `ENABLE_BROWSER_FALLBACK` | `boolean` | `true` | Enables authenticated Patchright browser fetching (**must be `true`**) |
+| `MIN_REQUEST_INTERVAL_MS`| `number` | `3000` | Minimum delay between outbound Reddit requests |
+| `CACHE_TTL_MINUTES` | `number` | `30` | Duration to keep fetched responses in cache |
+| `CIRCUIT_BREAKER_THRESHOLD` | `number` | `3` | Consecutive failures before tripping legacy HTTP circuit breaker |
+| `CIRCUIT_BREAKER_COOLDOWN_MS` | `number` | `1800000` | Cooldown period (30 min) for legacy HTTP circuit breaker |
+
+---
+
+## CLI Scripts
+
+| Command | Script | Description |
+| :--- | :--- | :--- |
+| `npm start` | `src/server.js` | Launches the Express API service. |
+| `npm run check-ip` | `scripts/check-ip.js` | Pre-flight test checking if the current sticky proxy IP is blocked or rate-limited. |
+| `npm run rotate-ip` | `scripts/rotate-ip.js` | Mints a new session token in `data/.proxy-session` for an immediate fresh exit IP. |
+| `npm run login` | `scripts/login.js` | Opens a visible browser through the proxy to create or refresh `data/browser-profile/`. |
+
+---
+
+## API Reference
+
+All endpoints except `/healthz` require an Authorization header:
+```http
+Authorization: Bearer <SERVICE_API_KEY>
+```
+
+### 1. Health Check
+Liveness probe for monitoring systems.
+
+- **URL**: `/healthz`
+- **Method**: `GET`
+- **Auth**: None
+
+#### Response (`200 OK`)
+```json
+{
+  "ok": true
+}
+```
+
+---
+
+### 2. Fetch New Subreddit Posts
+Fetches the newest posts from a specified subreddit.
+
+- **URL**: `/subreddit/:name/new`
+- **Method**: `GET`
+- **URL Parameters**:
+  - `name` *(string, required)*: Subreddit name (e.g. `technology`, `webdev`, `node`).
+- **Query Parameters**:
+  - `limit` *(number, optional)*: Number of posts to retrieve (default: `25`).
+
+#### Example Request
+```bash
+curl -X GET "http://localhost:4100/subreddit/webdev/new?limit=5" \
+  -H "Authorization: Bearer YOUR_SERVICE_API_KEY"
+```
+
+#### Example Response (`200 OK`)
+```json
+{
+  "posts": [
+    {
+      "source": "reddit",
+      "subreddit": "webdev",
+      "title": "Show Reddit: New microservice architecture overview",
+      "url": "https://reddit.com/r/webdev/comments/1abc23/show_reddit_new_microservice/",
+      "createdUtc": 1756123456,
+      "numComments": 14,
+      "score": 42
+    }
+  ]
+}
+```
+
+---
+
+### 3. Fetch Post by ID
+Retrieves detailed information for a single post using its Reddit ID (`t3_<id>`).
+
+- **URL**: `/post/:id`
+- **Method**: `GET`
+- **URL Parameters**:
+  - `id` *(string, required)*: The post's base36 Reddit ID (e.g. `1abc23` from `reddit.com/comments/1abc23/...`).
+
+#### Example Request
+```bash
+curl -X GET "http://localhost:4100/post/1abc23" \
+  -H "Authorization: Bearer YOUR_SERVICE_API_KEY"
+```
+
+#### Example Response (`200 OK`)
+```json
+{
+  "post": {
+    "id": "1abc23",
+    "name": "t3_1abc23",
+    "subreddit": "webdev",
+    "title": "Show Reddit: New microservice architecture overview",
+    "selftext": "Detailed post body content here...",
+    "author": "throwaway_user",
+    "score": 42,
+    "num_comments": 14,
+    "created_utc": 1756123456,
+    "permalink": "/r/webdev/comments/1abc23/show_reddit_new_microservice/",
+    "url": "https://www.reddit.com/r/webdev/comments/1abc23/show_reddit_new_microservice/"
+  }
+}
+```
+
+#### Error Responses
+- **`401 Unauthorized`**: Missing or invalid `Authorization` header.
+  ```json
+  { "error": "unauthorized" }
+  ```
+- **`404 Not Found`**: The requested post ID does not exist or has been deleted.
+  ```json
+  { "error": "not found" }
+  ```
+- **`502 Bad Gateway`**: Upstream Reddit block, rate limit, or session expiration.
+  ```json
+  { "error": "reddit session missing or expired - run `npm run login` to (re)authenticate" }
+  ```
+
+---
+
+## Production Deployment
+
+For continuous background execution, use a process manager like [PM2](https://pm2.keymetrics.io/):
+
+```bash
+# Start microservice with PM2
+pm2 start src/server.js --name reddit-scraper-service
+
+# View live logs
+pm2 logs reddit-scraper-service
+
+# Save PM2 state across system reboots
+pm2 save
+pm2 startup
+```
+
+> [!NOTE]
+> PM2 will automatically restart the service if an unhandled error occurs. However, if the Reddit session expires, PM2 cannot perform interactive re-login automatically. A manual execution of `npm run login` is required.
+
+---
+
+## Troubleshooting & Gotchas
+
+### 1. "Whoa there, pardner!" (Reddit Rate Limit)
+- **Cause**: The current residential exit IP has made too many requests across all customers sharing the pool.
+- **Fix**: Run `npm run rotate-ip`, then run `npm run check-ip` to confirm the new IP is clean, and restart the service.
+
+### 2. `SessionInvalidError` / Redirect to `/login`
+- **Cause**: Reddit invalidated or expired the authentication cookies.
+- **Fix**: Run `npm run login` in your terminal to refresh the browser profile, then restart the service.
+
+### 3. Akamai / Bot Protection 403
+- **Cause**: Headless detection triggered or proxy IP flagged.
+- **Fix**: Ensure `channel: "chrome"` is available and `headless: false` is not modified. Rotate proxy IP using `npm run rotate-ip`.
+
+### 4. Patchright installation missing
+- **Cause**: `patchright` npm package or Chromium binaries not installed.
+- **Fix**:
+  ```bash
+  npm install patchright
+  npx patchright install chromium
+  ```
+
+---
+
+## Project Structure
+
+```
+reddit-scraper-service/
+├── .env.example              # Sample configuration & proxy credentials
+├── package.json              # Service dependencies & lifecycle scripts
+├── README.md                 # Project documentation
+├── scripts/
+│   ├── check-ip.js           # Pre-flight diagnostic for current exit IP
+│   ├── login.js              # Interactive one-time manual login session
+│   └── rotate-ip.js          # Sticky session IP rotation utility
+└── src/
+    ├── cache.js              # In-memory TTL cache with stale fallback
+    ├── circuitBreaker.js     # Circuit breaker for legacy requests
+    ├── config.js             # Environment variable validation & defaults
+    ├── pageText.js           # Helper for extracting DOM text from browser
+    ├── proxy.js              # Proxy agent builder & session token manager
+    ├── rateLimiter.js        # Queue scheduler with delay and random jitter
+    ├── reddit.js             # Reddit business logic & mapper methods
+    ├── server.js             # Express API application & route definitions
+    └── fetcher/
+        ├── browser.js        # Stealth Patchright browser fetch implementation
+        └── http.js           # Legacy HTTP axios client fallback
+```
+
+---
+
+## License
+
+Private & Proprietary. Internal use only.
